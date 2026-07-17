@@ -61,3 +61,30 @@ def test_wsm_advance_turn():
     # Actually, in advance_turn morale recovery occurs when suppression == 0.
     # Since suppression decayed from 0.3 -> 0.1, it's still > 0, so morale stays at 0.8.
     assert wsm.current_state.units["u1"].soft_state.morale == 0.8
+
+def test_wsm_get_belief_state():
+    wsm = WorldStateManager("test_sim")
+    
+    # Friendly unit, always visible to commonwealth
+    cw_unit = CenturionUnit(id="cw1", name="CW Tank", faction="commonwealth")
+    
+    # Enemy unit, not spotted
+    tog_hidden = CenturionUnit(id="tog1", name="TOG Hidden", faction="tog", spotted_by=[])
+    
+    # Enemy unit, spotted by commonwealth
+    tog_spotted = CenturionUnit(id="tog2", name="TOG Spotted", faction="tog", spotted_by=["commonwealth"])
+    
+    wsm.add_unit(cw_unit)
+    wsm.add_unit(tog_hidden)
+    wsm.add_unit(tog_spotted)
+    
+    # Full information mode
+    full_state = wsm.get_state()
+    assert len(full_state.units) == 3
+    
+    # Fog of war mode for Commonwealth
+    belief_state = wsm.get_belief_state("commonwealth")
+    assert len(belief_state.units) == 2
+    assert "cw1" in belief_state.units
+    assert "tog2" in belief_state.units
+    assert "tog1" not in belief_state.units

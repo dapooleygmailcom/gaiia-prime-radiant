@@ -12,6 +12,7 @@ class CenturionUnit(BaseModel):
     thrust_points: int = 10
     soft_state: SoftState = Field(default_factory=SoftState)
     is_destroyed: bool = False
+    spotted_by: List[str] = Field(default_factory=list, description="Factions that have spotted this unit")
 
 class CenturionWorldState(BaseModel):
     simulation_id: str
@@ -31,6 +32,19 @@ class WorldStateManager:
 
     def get_state(self) -> CenturionWorldState:
         return self.current_state
+
+    def get_belief_state(self, faction_id: str) -> CenturionWorldState:
+        """
+        Returns a filtered state containing only units visible to the given faction.
+        A unit is visible if it belongs to the faction, or if the faction has spotted it.
+        """
+        belief = copy.deepcopy(self.current_state)
+        visible_units = {}
+        for uid, unit in belief.units.items():
+            if unit.faction == faction_id or faction_id in unit.spotted_by:
+                visible_units[uid] = unit
+        belief.units = visible_units
+        return belief
 
     def add_unit(self, unit: CenturionUnit):
         self.current_state.units[unit.id] = unit

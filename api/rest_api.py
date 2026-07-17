@@ -7,16 +7,21 @@ from engine.kernel.soft_state_layer import SoftState
 from engine.rules.rules_interface import RulesInterface
 from engine.modeller.outcome_modeller import OutcomeModeller
 from engine.planner.action_planner import ActionPlanner
+from engine.planner.adversarial_planner import AdversarialPlanner
+from engine.planner.doctrine_profiles import DoctrineProfileManager
 
 app = FastAPI(title="Gaiia Prime Radiant REST API", version="0.1.0")
 
 # In-memory dictionary storing active simulations
-active_simulations: Dict[str, WorldStateManager] = {}
+# Stores {"wsm": WorldStateManager, "config": NewSimulationRequest}
+active_simulations: Dict[str, Any] = {}
 
 # Instantiate rule integration globally
 rules_interface = RulesInterface()
 outcome_modeller = OutcomeModeller(rules_interface)
-action_planner = ActionPlanner(outcome_modeller)
+doctrine_manager = DoctrineProfileManager()
+ap_alpha = ActionPlanner(outcome_modeller)
+ap_beta_tog = AdversarialPlanner(outcome_modeller, doctrine_manager, faction="tog", doctrine="aggressive")
 
 @app.post("/simulation/new", response_model=NewSimulationResponse)
 def create_simulation(req: NewSimulationRequest):
@@ -53,7 +58,10 @@ def create_simulation(req: NewSimulationRequest):
     wsm.add_unit(tog_unit)
     wsm.take_snapshot()
 
-    active_simulations[sim_id] = wsm
+    active_simulations[sim_id] = {
+        "wsm": wsm,
+        "config": req
+    }
     return NewSimulationResponse(
         simulation_id=sim_id,
         turn=wsm.current_state.turn,
@@ -64,27 +72,41 @@ def create_simulation(req: NewSimulationRequest):
 def get_state(sim_id: str):
     if sim_id not in active_simulations:
         raise HTTPException(status_code=404, detail="Simulation not found")
-    wsm = active_simulations[sim_id]
+    wsm = active_simulations[sim_id]["wsm"]
     return wsm.current_state
 
 @app.post("/simulation/{sim_id}/recommend")
 def recommend_actions(sim_id: str, req: RecommendActionsRequest):
     if sim_id not in active_simulations:
         raise HTTPException(status_code=404, detail="Simulation not found")
-    wsm = active_simulations[sim_id]
+    session = active_simulations[sim_id]
+    wsm = session["wsm"]
+    config = session["config"]
     
     unit = wsm.current_state.units.get(req.unit_id)
     if not unit:
         raise HTTPException(status_code=404, detail="Unit not found")
 
-    actions = action_planner.plan_actions(unit, wsm.current_state, req.objective)
+    # Determine which state to pass (Fog of War)
+    if config.information_mode == "fog_of_war":
+        planning_state = wsm.get_belief_state(unit.faction)
+    else:
+        planning_state = wsm.current_state
+
+    # Determine which planner to use
+    if unit.faction == "tog":
+        planner = ap_beta_tog
+    else:
+        planner = ap_alpha
+
+    actions = planner.plan_actions(unit, planning_state, req.objective)
     return {"unit_id": req.unit_id, "recommendations": actions}
 
 @app.post("/simulation/{sim_id}/advance")
 def advance_turn(sim_id: str, req: AdvanceTurnRequest):
     if sim_id not in active_simulations:
         raise HTTPException(status_code=404, detail="Simulation not found")
-    wsm = active_simulations[sim_id]
+    wsm = active_simulations[sim_id]["wsm"]
 
     unit = wsm.current_state.units.get(req.unit_id)
     if not unit:
