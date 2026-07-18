@@ -28,20 +28,20 @@ def test_wsm_snapshot_and_rollback():
     wsm.take_snapshot()
 
     # Change state in turn 1
-    wsm.current_state.turn = 1
-    wsm.current_state.units["u1"].position = [3, 4]
-    wsm.current_state.units["u1"].soft_state.apply_suppression(0.5)
+    wsm.get_state().turn = 1
+    wsm.get_state().units["u1"].position = [3, 4]
+    wsm.get_state().units["u1"].soft_state.apply_suppression(0.5)
 
     # Verify changed state
-    assert wsm.current_state.units["u1"].position == [3, 4]
-    assert wsm.current_state.units["u1"].soft_state.suppression == 0.5
+    assert wsm.get_state().units["u1"].position == [3, 4]
+    assert wsm.get_state().units["u1"].soft_state.suppression == 0.5
 
     # Rollback to turn 0
     success = wsm.rollback(0)
     assert success is True
-    assert wsm.current_state.turn == 0
-    assert wsm.current_state.units["u1"].position == [1, 2]
-    assert wsm.current_state.units["u1"].soft_state.suppression == 0.0
+    assert wsm.get_state().turn == 0
+    assert wsm.get_state().units["u1"].position == [1, 2]
+    assert wsm.get_state().units["u1"].soft_state.suppression == 0.0
 
 def test_wsm_advance_turn():
     wsm = WorldStateManager("test_sim")
@@ -54,13 +54,13 @@ def test_wsm_advance_turn():
     wsm.add_unit(unit)
 
     wsm.advance_turn()
-    assert wsm.current_state.turn == 1
+    assert wsm.get_state().turn == 1
     # Check suppression decayed by 0.2
-    assert wsm.current_state.units["u1"].soft_state.suppression == 0.1
+    assert wsm.get_state().units["u1"].soft_state.suppression == 0.1
     # Check morale didn't recover because suppression was > 0 during the turn (before decay or condition)
     # Actually, in advance_turn morale recovery occurs when suppression == 0.
     # Since suppression decayed from 0.3 -> 0.1, it's still > 0, so morale stays at 0.8.
-    assert wsm.current_state.units["u1"].soft_state.morale == 0.8
+    assert wsm.get_state().units["u1"].soft_state.morale == 0.8
 
 def test_wsm_get_belief_state():
     wsm = WorldStateManager("test_sim")
@@ -88,3 +88,44 @@ def test_wsm_get_belief_state():
     assert "cw1" in belief_state.units
     assert "tog2" in belief_state.units
     assert "tog1" not in belief_state.units
+
+def test_wsm_create_unit_from_entity():
+    from engine.rules.rules_interface import RulesInterface
+    
+    # We will mock the get_entity_data method instead of requiring a real RAG-Doll setup
+    class MockRulesInterface(RulesInterface):
+        def __init__(self):
+            pass
+            
+        def get_entity_data(self, entity_name: str) -> dict:
+            return {
+                "entity_type": "vehicle",
+                "name": "Horatius",
+                "attributes": {
+                    "Maximum Thrust": 6
+                },
+                "grids": {
+                    "Front Armor": { "SF": 7, "Width": 10, "Depth": 7 }
+                },
+                "collections": {
+                    "Weapons": [
+                        { "Name": "150mm", "Location": "Hull 1", "Damage": "T", "Range": "15" }
+                    ]
+                }
+            }
+
+    wsm = WorldStateManager("test_sim")
+    mock_rules = MockRulesInterface()
+    
+    unit = wsm.create_unit_from_entity(id="u1", faction="tog", entity_name="tog_horatius", rules=mock_rules)
+    
+    assert unit.id == "u1"
+    assert unit.name == "Horatius"
+    assert unit.faction == "tog"
+    assert unit.thrust_points == 6
+    assert unit.entity_profile is not None
+    assert unit.entity_profile["grids"]["Front Armor"]["SF"] == 7
+    
+    state = wsm.get_state()
+    assert len(state.units) == 1
+    assert state.units["u1"].thrust_points == 6

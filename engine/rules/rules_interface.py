@@ -185,3 +185,15 @@ class RulesInterface:
             "confidence": 0.0,
             "source_chunks": []
         }
+
+    def get_entity_data(self, entity_name: str) -> Dict[str, Any]:
+        """
+        Retrieves agnostic entity data (like a vehicle SSD) from RAG-Doll.
+        """
+        entity_file = os.path.join(rag_doll_path, f"data/entities/{entity_name}.json")
+        if os.path.exists(entity_file):
+            with open(entity_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        else:
+            raise FileNotFoundError(f"Entity profile for '{entity_name}' not found at {entity_file}")
+
