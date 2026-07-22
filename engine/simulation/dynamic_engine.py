@@ -185,12 +185,20 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
             max_thrust = u.entity_profile.get("attributes", {}).get("Maximum Thrust", 0) if hasattr(u, 'entity_profile') else 0
             state_desc += f"Unit {u.id} ({u.faction}): pos={u.position}, heading={u.heading}, velocity={u.velocity}, max_thrust={max_thrust}\n"
             
+        state_desc += "\nMap Features (non-clear hexes):\n"
+        for hex_coord, hex_data in engine.wsm.get_state().map_hexes.items():
+            if hex_data.get("terrain") and hex_data.get("terrain") != "Clear":
+                state_desc += f"Hex {hex_coord}: {hex_data.get('terrain')}\n"
+                
         arbiter_prompt = (
             f"The state is:\n{state_desc}\n"
             f"Simulation Objective: {objective}\n\n"
+            f"The map is a Hex grid. Coordinates are 4 digits: XXYY (XX=column, YY=row).\n"
+            f"Moving South (Heading 4) increases YY by 1 (e.g., 1001 -> 1002). Moving North (Heading 1) decreases YY by 1.\n"
             f"It is your {phase}. Please ask me any questions about the rules, your capabilities, or terms you do not understand before deciding.\n"
             f"*IMPORTANT RULE: Hex facing needs to be set as clockwise from top, where top is 1, bottom is 4.*\n"
-            f"When you are ready to act, issue your command in a structured format, e.g. [MOVE: Posture=Aggressive, Heading=<number>, EndVelocity=<number>, Path=1001,1002,1003]"
+            f"When you are ready to act, issue your command in a structured format for each unit you control, e.g. [MOVE: Unit=<id>, Posture=Aggressive, Heading=<number>, EndVelocity=<number>, Path=1001,1002,1003,1004]\n"
+            f"You MUST plot your Path hex-by-hex, listing every single hex you traverse. The number of hex steps in your Path MUST EXACTLY EQUAL your EndVelocity!"
         )
         
         messages = [
@@ -226,12 +234,22 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
             if "Movement" in phase:
                 resolve_func = self.get_or_generate_mechanic("resolve_movement", "Resolve a movement command string against a unit's physics.")
                 if resolve_func:
-                    unit = next((u for u in engine.wsm.get_state().units.values() if u.faction == active_faction), None)
-                    if unit:
-                        try:
-                            resolve_func(unit, engine.wsm, final_action)
-                        except Exception as e:
-                            print(f"[MASTER ARBITER]: Error applying movement: {e}")
+                    matches = re.finditer(r'\[MOVE:\s*(.*?)\]', final_action, re.IGNORECASE)
+                    for match in matches:
+                        cmd_str = match.group(1).strip()
+                        unit_match = re.search(r'Unit=([^,]+)', cmd_str, re.IGNORECASE)
+                        if unit_match:
+                            unit_id = unit_match.group(1).strip()
+                            unit = engine.wsm.get_state().units.get(unit_id)
+                        else:
+                            unit = next((u for u in engine.wsm.get_state().units.values() if u.faction == active_faction), None)
+                            
+                        if unit and unit.faction == active_faction:
+                            try:
+                                # Re-wrap with [MOVE: ...] so the physics engine can parse it as expected
+                                resolve_func(unit, engine.wsm, f"[MOVE: {cmd_str}]")
+                            except Exception as e:
+                                print(f"[MASTER ARBITER]: Error applying movement to {unit.id}: {e}")
         else:
             print("[MASTER ARBITER]: Commander failed to issue a valid action command within dialogue limits.")
 class SideCommander:
@@ -244,45 +262,6 @@ class SideCommander:
         self.dynamic_globals = dynamic_globals
         self.model_name = model_name
 
-    def evaluate_and_act(self, wsm: WorldStateManager, phase: str, context: str = "") -> str:
-        """
-        Queries the state and returns the commander's orders based on the current phase.
-        """
-        print(f"\n--- Waking {self.faction_name.upper()} Side Commander ({phase} Phase) ---")
-        state_desc = f"Turn {wsm.get_state().turn}\n"
-        for u in wsm.get_state().units.values():
-            max_thrust = u.entity_profile.get("attributes", {}).get("Maximum Thrust", 0) if hasattr(u, 'entity_profile') else 0
-            state_desc += f"Unit {u.id} ({u.faction}): pos={u.position}, heading={u.heading}, velocity={u.velocity}, max_thrust={max_thrust}, destroyed={u.is_destroyed}\n"
-            
-        if phase == "Movement Phase" or "Movement" in phase:
-            sys_prompt = f"You are the Side Commander for {self.faction_name.upper()}.\nCurrent State:\n{state_desc}\nYour goal is to get as close to the enemy as you can.\n"
-            sys_prompt += "Decide your posture and movement. Postures: Neutral, Aggressive, Defensive.\n"
-            sys_prompt += "You can ask the Game Master (Master Arbiter) for any rules you need before deciding.\n"
-            sys_prompt += "Issue your command like this when ready:\n[MOVE: Posture=Aggressive, Heading=<number>, EndVelocity=<number>]\nExplain your reasoning first."
-        elif phase == "Combat Phase" or "Combat" in phase:
-            sys_prompt = f"You are the Side Commander for {self.faction_name.upper()}.\nCurrent State:\n{state_desc}\nYour goal is to destroy the enemy tank and survive.\n"
-            sys_prompt += f"{context}\n" if context else ""
-            sys_prompt += "Decide your fire barrage at enemy units. You may fire multiple weapons in your arc simultaneously.\n"
-            sys_prompt += "Issue command exactly like this when ready:\n[FIRE: Target=hor1, TargetFacing=Front, Weapons=Laser;150mm;TVLG, Painting=True]\nExplain your logic."
-        else:
-            sys_prompt = f"You are the Side Commander for {self.faction_name.upper()}.\nCurrent phase is {phase}. Do nothing or ask the Arbiter what to do."
-
-        messages = [{"role": "system", "content": sys_prompt}]
-        try:
-            response = ollama.chat(model=self.model_name, messages=messages)
-        except Exception:
-            response = ollama.chat(model="llama3.1:8b", messages=messages)
-            
-        content = response["message"]["content"]
-        print(f"[{self.faction_name.upper()} Commander]:\n{content.strip()}\n")
-        
-        # Log to reasoning trace
-        trace_path = "C:/Users/dapoo/.gemini/antigravity-ide/brain/68c2581d-4958-44bc-8dcc-ceb65471fe04/reasoning_trace.md"
-        with open(trace_path, "a") as f:
-            f.write(f"### {self.faction_name.upper()} Commander ({phase} Phase, Turn {wsm.get_state().turn})\n")
-            f.write(f"{content.strip()}\n\n---\n")
-            
-        return content
 
 
 class DynamicEngine:
