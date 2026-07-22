@@ -302,6 +302,84 @@ class DynamicEngine:
         
     def add_commander(self, faction: str):
         self.commanders[faction] = SideCommander(faction, self.dynamic_globals)
-        
-        pass
+
+    def initialize_default_scenario(self):
+        # Initialize basic Centurion grid map
+        self.wsm.set_hex(1, 1, "woods")
+        self.wsm.set_hex(1, 2, "plain")
+        self.wsm.set_hex(2, 1, "rough")
+        self.wsm.set_hex(2, 2, "plain")
+
+        # Spawn friendly Commonwealth and adversarial TOG units
+        try:
+            cw_unit = self.wsm.create_unit_from_entity("cw_tank_1", "commonwealth", "rl_liberator_medium_grav_tank", self.rules)
+            cw_unit.position = "0101"
+        except Exception as e:
+            print(f"Warning: Falling back to manual cw_unit creation. Error: {e}")
+            from engine.kernel.world_state_manager import CenturionUnit
+            from engine.kernel.soft_state_layer import SoftState
+            cw_unit = CenturionUnit(
+                id="cw_tank_1",
+                name="Commonwealth Grav Tank Alpha",
+                faction="commonwealth",
+                position="0101",
+                velocity=0,
+                thrust_points=10,
+                soft_state=SoftState(morale=1.0, suppression=0.0)
+            )
+            self.wsm.add_unit(cw_unit)
+
+        try:
+            tog_unit = self.wsm.create_unit_from_entity("tog_grav_1", "tog", "tog_horatius_medium_grav_tank", self.rules)
+            tog_unit.position = "0202"
+        except Exception as e:
+            print(f"Warning: Falling back to manual tog_unit creation. Error: {e}")
+            from engine.kernel.world_state_manager import CenturionUnit
+            from engine.kernel.soft_state_layer import SoftState
+            tog_unit = CenturionUnit(
+                id="tog_grav_1",
+                name="TOG Grav Tank Victrix",
+                faction="tog",
+                position="0202",
+                velocity=0,
+                thrust_points=10,
+                soft_state=SoftState(morale=1.0, suppression=0.0)
+            )
+            self.wsm.add_unit(tog_unit)
+
+        self.add_commander("commonwealth")
+        self.add_commander("tog")
+        self.wsm.take_snapshot()
+
+    def recommend_actions(self, unit_id: str, objective: str) -> str:
+        # Find unit
+        unit = self.wsm.get_state().units.get(unit_id)
+        if not unit:
+            raise ValueError(f"Unit {unit_id} not found")
+            
+        commander = self.commanders.get(unit.faction)
+        if not commander:
+            raise ValueError(f"No commander for faction {unit.faction}")
+            
+        # We will assume Movement Phase for now in this simple API integration
+        return commander.evaluate_and_act(self.wsm, "Movement Phase", context=f"Objective: {objective}")
+
+    def advance_turn(self, unit_id: str, chosen_action: Dict[str, Any]) -> str:
+        unit = self.wsm.get_state().units.get(unit_id)
+        if not unit:
+            raise ValueError(f"Unit {unit_id} not found")
+            
+        command_str = chosen_action.get("command", "")
+        if not command_str:
+            raise ValueError("No command string provided in chosen_action")
+            
+        if "MOVE" in command_str:
+            resolve_func = self.arbiter.get_or_generate_mechanic("resolve_movement", "Resolve a movement command string against a unit's physics.")
+            if resolve_func:
+                resolve_func(unit, self.wsm, command_str)
+                return "Movement resolved successfully."
+            else:
+                raise RuntimeError("Failed to generate or retrieve resolve_movement mechanic")
+                
+        return "Command not recognized or unsupported phase."
 
