@@ -124,7 +124,7 @@ class RulesInterface:
                 emb_resp = ollama.embeddings(model="nomic-embed-text", prompt=query)
                 results = collection.query(
                     query_embeddings=[emb_resp["embedding"]],
-                    n_results=3,
+                    n_results=10,
                     include=["documents", "metadatas"]
                 )
                 if results["documents"] and results["documents"][0]:

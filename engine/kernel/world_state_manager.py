@@ -13,10 +13,11 @@ class CenturionUnit(BaseModel):
     id: str
     name: str
     faction: str  # "commonwealth" or "tog"
-    position: List[int] = Field(default_factory=lambda: [0, 0], description="Hex coordinate [q, r]")
+    position: str = Field(default="0001", description="Hex coordinate as 4-digit string (e.g., '1001')")
     velocity: int = 0
     heading: int = 0
     thrust_points: int = 10
+    pilot_skill: int = 5
     soft_state: SoftState = Field(default_factory=SoftState)
     is_destroyed: bool = False
     spotted_by: List[str] = Field(default_factory=list, description="Factions that have spotted this unit")
@@ -27,13 +28,13 @@ class CenturionWorldState(BaseModel):
     simulation_id: str
     turn: int = 0
     units: Dict[str, CenturionUnit] = Field(default_factory=dict)
-    map_hexes: Dict[str, str] = Field(default_factory=dict, description="q,r key to terrain type")
+    map_hexes: Dict[str, Dict[str, Any]] = Field(default_factory=dict, description="q,r key to {'terrain': type, 'elevation': int}")
 
 class PrefectUnit(BaseModel):
     id: str
     name: str
     faction: str
-    position: List[int] = Field(default_factory=lambda: [0, 0])
+    position: str = Field(default="0001", description="Hex coordinate as 4-digit string")
     supply_level: float = Field(default=1.0, description="1.0 is fully supplied, 0.0 is out of supply")
     soft_state: SoftState = Field(default_factory=SoftState)
     is_destroyed: bool = False
@@ -49,7 +50,7 @@ class LeviathanUnit(BaseModel):
     id: str
     name: str
     faction: str
-    position: List[int] = Field(default_factory=lambda: [0, 0], description="Hex coordinate [q, r]")
+    position: str = Field(default="0001", description="Hex coordinate as 4-digit string")
     velocity: int = 0
     heading: int = 0
     soft_state: SoftState = Field(default_factory=SoftState)
@@ -68,7 +69,7 @@ class InterceptorUnit(BaseModel):
     id: str
     name: str
     faction: str
-    position: List[int] = Field(default_factory=lambda: [0, 0, 0], description="Hex coordinate [q, r, altitude]")
+    position: str = Field(default="0001", description="Hex coordinate as string")
     velocity: int = 0
     heading: int = 0
     soft_state: SoftState = Field(default_factory=SoftState)
@@ -85,7 +86,7 @@ class LegionnaireUnit(BaseModel):
     id: str
     name: str
     faction: str
-    position: List[int] = Field(default_factory=lambda: [0, 0], description="Square grid coordinate [x, y]")
+    position: str = Field(default="0001", description="Square coordinate as string")
     stance: str = "standing"
     soft_state: SoftState = Field(default_factory=SoftState)
     is_incapacitated: bool = False
@@ -155,16 +156,15 @@ class WorldStateManager:
         self.get_state().units[unit.id] = unit
         # Add to graph
         self.graph.add_node(unit.id, type="centurion_unit", unit=unit)
-        # Link to hex
-        hex_id = f"hex_{unit.position[0]}_{unit.position[1]}"
+        hex_id = f"hex_{unit.position}"
         self.graph.add_edge(unit.id, hex_id, relation="LOCATED_IN")
 
-    def set_hex(self, q: int, r: int, terrain_type: str):
-        hex_id = f"{q},{r}"
-        graph_hex_id = f"hex_{q}_{r}"
-        self.get_state().map_hexes[hex_id] = terrain_type
+    def set_hex(self, col: int, row: int, terrain_type: str, elevation: int = 0):
+        hex_id = f"{col:02d}{row:02d}"
+        graph_hex_id = f"hex_{hex_id}"
+        self.get_state().map_hexes[hex_id] = {"terrain": terrain_type, "elevation": elevation}
         
-        self.graph.add_node(graph_hex_id, type="hex", q=q, r=r, terrain=terrain_type)
+        self.graph.add_node(graph_hex_id, type="hex", col=col, row=row, terrain=terrain_type, elevation=elevation)
 
     def create_unit_from_entity(self, id: str, faction: str, entity_name: str, rules: RulesInterface) -> CenturionUnit:
         profile = rules.get_entity_data(entity_name)
@@ -178,9 +178,10 @@ class WorldStateManager:
                 width = grid_data.get("Width", 10)
                 depth = grid_data.get("Depth", 0)
                 damage_state.armor_grids[grid_name] = [depth] * width
-            elif "Rows" in grid_data:
-                width = grid_data.get("Columns", 10)
-                depth = grid_data.get("Rows", 1)
+            elif "Columns" in grid_data and isinstance(grid_data["Columns"], list):
+                cols = grid_data["Columns"]
+                width = len(cols)
+                depth = len(cols[0]) if width > 0 else 0
                 damage_state.internal_grids[grid_name] = [[False] * depth for _ in range(width)]
                 
         unit = CenturionUnit(
@@ -216,23 +217,23 @@ class WorldStateManager:
         
         # Rebuild hexes and units from Centurion state
         for eng_id, eng_state in self.current_state.centurion_engagements.items():
-            for hex_id_str, terrain in eng_state.map_hexes.items():
-                q, r = hex_id_str.split(",")
-                self.graph.add_node(f"hex_{q}_{r}", type="hex", q=int(q), r=int(r), terrain=terrain)
+            for hex_id_str, hex_data in eng_state.map_hexes.items():
+                col = int(hex_id_str[:2])
+                row = int(hex_id_str[2:])
+                self.graph.add_node(f"hex_{hex_id_str}", type="hex", col=col, row=row, terrain=hex_data.get("terrain", "Clear"), elevation=hex_data.get("elevation", 0))
                 
             for uid, unit in eng_state.units.items():
                 self.graph.add_node(uid, type="centurion_unit", unit=unit)
-                hex_id = f"hex_{unit.position[0]}_{unit.position[1]}"
+                hex_id = f"hex_{unit.position}"
                 self.graph.add_edge(uid, hex_id, relation="LOCATED_IN")
                 
         # Rebuild Prefect state
         for hex_id_str, terrain in self.current_state.prefect_state.map_hexes.items():
-            q, r = hex_id_str.split(",")
-            self.graph.add_node(f"pref_hex_{q}_{r}", type="prefect_hex", q=int(q), r=int(r), terrain=terrain)
+            self.graph.add_node(f"pref_hex_{hex_id_str}", type="prefect_hex", terrain=terrain)
             
         for uid, unit in self.current_state.prefect_state.units.items():
             self.graph.add_node(uid, type="prefect_unit", unit=unit)
-            hex_id = f"pref_hex_{unit.position[0]}_{unit.position[1]}"
+            hex_id = f"pref_hex_{unit.position}"
             self.graph.add_edge(uid, hex_id, relation="LOCATED_IN")
 
     def advance_turn(self):

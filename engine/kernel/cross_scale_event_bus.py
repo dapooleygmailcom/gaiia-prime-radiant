@@ -19,6 +19,8 @@ class CrossScaleEventBus:
         # Register core handlers
         self.subscribe("SOFT_STATE_CASCADE", self._handle_soft_state_cascade)
         self.subscribe("INFLUENCE_VECTOR", self._handle_influence_vector)
+        self.subscribe("UNIT_DESTROYED", self._handle_unit_loss_morale_contagion)
+        self.subscribe("UNIT_ROUTED", self._handle_unit_loss_morale_contagion)
 
     def subscribe(self, event_type: str, handler: Callable[[Event], None]) -> None:
         if event_type not in self.subscribers:
@@ -29,6 +31,23 @@ class CrossScaleEventBus:
         if event.event_type in self.subscribers:
             for handler in self.subscribers[event.event_type]:
                 handler(event)
+
+    def _handle_unit_loss_morale_contagion(self, event: Event) -> None:
+        """
+        When a unit is destroyed or routed, apply a morale penalty to all friendly units 
+        in the same engagement to model morale contagion.
+        """
+        payload = event.payload
+        engagement_id = payload.get("engagement_id")
+        faction = payload.get("faction")
+        
+        if event.source_scale == "centurion" and engagement_id:
+            cent_state = self.wsm.current_state.centurion_engagements.get(engagement_id)
+            if cent_state:
+                # Apply a standard -0.1 morale drop to friendly units
+                for unit in cent_state.units.values():
+                    if unit.faction == faction:
+                        unit.soft_state.morale = max(0.0, unit.soft_state.morale - 0.1)
 
     def _handle_soft_state_cascade(self, event: Event) -> None:
         """

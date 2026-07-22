@@ -24,7 +24,14 @@ class RuleCache:
                         query TEXT,
                         value_json TEXT,
                         last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
+                    );
+                """)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS compiled_mechanics (
+                        mechanic_name TEXT PRIMARY KEY,
+                        python_code TEXT,
+                        last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
                 """)
 
     def _hash_query(self, query: str) -> str:
@@ -55,4 +62,23 @@ class RuleCache:
         with closing(sqlite3.connect(self.db_path)) as conn:
             with conn:
                 conn.execute("DELETE FROM rule_cache")
+                conn.execute("DELETE FROM compiled_mechanics")
+                
+    def get_compiled(self, mechanic_name: str) -> Optional[str]:
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            cursor = conn.execute("SELECT python_code FROM compiled_mechanics WHERE mechanic_name = ?", (mechanic_name,))
+            row = cursor.fetchone()
+            if row:
+                with conn:
+                    conn.execute("UPDATE compiled_mechanics SET last_accessed = CURRENT_TIMESTAMP WHERE mechanic_name = ?", (mechanic_name,))
+                return row[0]
+        return None
+
+    def set_compiled(self, mechanic_name: str, python_code: str):
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO compiled_mechanics (mechanic_name, python_code, last_accessed)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                """, (mechanic_name, python_code))
 

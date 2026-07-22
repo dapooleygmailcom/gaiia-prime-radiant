@@ -15,7 +15,10 @@ class RuleFeedbackInterface:
 
     def _init_db(self):
         import os
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        if self.db_path != ":memory:":
+            dirname = os.path.dirname(self.db_path)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
         with closing(sqlite3.connect(self.db_path)) as conn:
             with conn:
                 conn.execute("""
