@@ -198,7 +198,7 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
             f"It is your {phase}. Please ask me any questions about the rules, your capabilities, or terms you do not understand before deciding.\n"
             f"*IMPORTANT RULE: Hex facing needs to be set as clockwise from top, where top is 1, bottom is 4.*\n"
             f"When you are ready to act, issue your command in a structured format for each unit you control, e.g. [MOVE: Unit=<id>, Posture=Aggressive, Heading=<number>, EndVelocity=<number>, Path=1001,1002,1003,1004]\n"
-            f"You MUST plot your Path hex-by-hex, listing every single hex you traverse. The number of hex steps in your Path MUST EXACTLY EQUAL your EndVelocity!"
+            f"You MUST plot your Path hex-by-hex, listing every single hex you traverse (EXCLUDING your starting hex). The number of hex steps in your Path MUST EXACTLY EQUAL your EndVelocity!"
         )
         
         messages = [
@@ -208,8 +208,11 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
         
         print(f"[ARBITER -> {active_faction.upper()}]:\n{arbiter_prompt}\n")
         
+        # Add system instruction for CoT reasoning
+        messages[0]["content"] += " Always output a brief step-by-step reasoning block BEFORE your final command."
+        
         final_action = None
-        for _ in range(3): # Allow up to 3 dialogue exchanges
+        for _ in range(5): # Allow up to 5 dialogue exchanges
             try:
                 response = ollama.chat(model=commander.model_name, messages=messages)
             except Exception:
@@ -221,6 +224,55 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
             
             # Check if an action was issued
             if "[" in content and "]" in content and ":" in content:
+                print(f"[MASTER ARBITER]: Action received. Verifying against rules and applying physics...")
+                
+                validation_error = None
+                
+                # Snapshot unit state in case we need to rollback a partial failure
+                state_backup = []
+                for u in engine.wsm.get_state().units.values():
+                    state_backup.append((u, u.position, u.velocity, u.heading, u.thrust_points))
+                    
+                if "Movement" in phase:
+                    resolve_func = self.get_or_generate_mechanic("resolve_movement", "Resolve a movement command string against a unit's physics.")
+                    if resolve_func:
+                        matches = list(re.finditer(r'\[MOVE:\s*(.*?)\]', content, re.IGNORECASE))
+                        if not matches:
+                            validation_error = "No valid [MOVE: ...] blocks found in your response."
+                        
+                        seen_units = set()
+                        for match in reversed(matches):
+                            cmd_str = match.group(1).strip()
+                            unit_match = re.search(r'Unit=([^,]+)', cmd_str, re.IGNORECASE)
+                            if unit_match:
+                                unit_id = unit_match.group(1).strip()
+                                unit = engine.wsm.get_state().units.get(unit_id)
+                            else:
+                                unit = next((u for u in engine.wsm.get_state().units.values() if u.faction == active_faction), None)
+                                
+                            if unit and unit.faction == active_faction:
+                                if unit.id in seen_units:
+                                    continue
+                                seen_units.add(unit.id)
+                                try:
+                                    resolve_func(unit, engine.wsm, f"[MOVE: {cmd_str}]")
+                                except Exception as e:
+                                    validation_error = str(e)
+                                    break
+                
+                if validation_error:
+                    # Rollback all units to state before this attempt
+                    for u, p, v, h, t in state_backup:
+                        u.position = p
+                        u.velocity = v
+                        u.heading = h
+                        u.thrust_points = t
+                        
+                    arbiter_rejection = f"Invalid Command: {validation_error} Please explain your mistake, recount your path step-by-step, and issue a corrected command."
+                    print(f"[MASTER ARBITER]:\n{arbiter_rejection}\n")
+                    messages.append({"role": "user", "content": arbiter_rejection})
+                    continue # Loop back to LLM to try again
+                    
                 final_action = content
                 break
                 
@@ -229,28 +281,7 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
             print(f"[MASTER ARBITER]:\n{arbiter_answer}\n")
             messages.append({"role": "user", "content": arbiter_answer})
             
-        if final_action:
-            print(f"[MASTER ARBITER]: Action received. Verifying against rules and applying physics via deterministic scripts...")
-            if "Movement" in phase:
-                resolve_func = self.get_or_generate_mechanic("resolve_movement", "Resolve a movement command string against a unit's physics.")
-                if resolve_func:
-                    matches = re.finditer(r'\[MOVE:\s*(.*?)\]', final_action, re.IGNORECASE)
-                    for match in matches:
-                        cmd_str = match.group(1).strip()
-                        unit_match = re.search(r'Unit=([^,]+)', cmd_str, re.IGNORECASE)
-                        if unit_match:
-                            unit_id = unit_match.group(1).strip()
-                            unit = engine.wsm.get_state().units.get(unit_id)
-                        else:
-                            unit = next((u for u in engine.wsm.get_state().units.values() if u.faction == active_faction), None)
-                            
-                        if unit and unit.faction == active_faction:
-                            try:
-                                # Re-wrap with [MOVE: ...] so the physics engine can parse it as expected
-                                resolve_func(unit, engine.wsm, f"[MOVE: {cmd_str}]")
-                            except Exception as e:
-                                print(f"[MASTER ARBITER]: Error applying movement to {unit.id}: {e}")
-        else:
+        if not final_action:
             print("[MASTER ARBITER]: Commander failed to issue a valid action command within dialogue limits.")
 class SideCommander:
     """
