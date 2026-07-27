@@ -12,6 +12,8 @@ class DamageState(BaseModel):
 class CenturionUnit(BaseModel):
     id: str
     name: str
+    tvlg_ammo: int = Field(default=0, description="Remaining TVLG ammo")
+    smlm_ammo: int = Field(default=0, description="Remaining SMLM ammo")
     faction: str  # "commonwealth" or "tog"
     position: str = Field(default="0001", description="Hex coordinate as 4-digit string (e.g., '1001')")
     velocity: int = 0
@@ -184,10 +186,15 @@ class WorldStateManager:
                 depth = len(cols[0]) if width > 0 else 0
                 damage_state.internal_grids[grid_name] = [[False] * depth for _ in range(width)]
                 
+        tvlg_ammo = next((m['Count'] for m in profile.get('collections',{}).get('Missiles',[]) if m['Type']=='TVLG'), 0)
+        smlm_ammo = next((m['Count'] for m in profile.get('collections',{}).get('Missiles',[]) if m['Type']=='SMLM'), 0)
+        
         unit = CenturionUnit(
             id=id,
             name=profile.get("name", entity_name),
             faction=faction,
+            tvlg_ammo=tvlg_ammo,
+            smlm_ammo=smlm_ammo,
             thrust_points=thrust,
             entity_profile=profile,
             damage_state=damage_state
