@@ -133,7 +133,7 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
             
         return response["message"]["content"]
 
-    def orchestrate_game(self, engine: Any, objective: str, target_phase: str = None, turns: int = 1):
+    def orchestrate_game(self, engine: Any, objective: str, target_phase: str = None, turns: int = 1, initiative_winner: str = None):
         """
         The main system-agnostic orchestrator loop.
         Queries RAG for the turn sequence and drives the simulation.
@@ -162,15 +162,35 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
             engine.wsm.get_state().turn = turn
             print(f"\n=================== TURN {turn} ===================")
             
+            factions = list(engine.commanders.keys())
+            if not factions:
+                print("[MASTER ARBITER] No commanders assigned. Aborting.")
+                return
+                
+            if initiative_winner and initiative_winner in factions:
+                winner = initiative_winner
+            else:
+                import random
+                winner = random.choice(factions)
+                
+            loser = [f for f in factions if f != winner]
+            loser = loser[0] if loser else winner
+            
+            turn_order = [loser, winner]
+            
             for phase in phases:
                 if target_phase and target_phase not in phase:
                     continue # Skip phases we aren't testing right now
                     
                 print(f"\n--- {phase.upper()} ---")
-                # Simplified initiative: just let commonwealth go for the test
-                active_faction = "commonwealth"
                 
-                self.run_phase_dialogue(engine, phase, active_faction, objective)
+                if "Initiative" in phase:
+                    print(f"[MASTER ARBITER] Initiative for Turn {turn} goes to: {winner.upper()}")
+                    continue
+                    
+                for active_faction in turn_order:
+                    print(f"\n[{active_faction.upper()}'s Action]")
+                    self.run_phase_dialogue(engine, phase, active_faction, objective)
 
     def run_phase_dialogue(self, engine: Any, phase: str, active_faction: str, objective: str):
         """
@@ -189,20 +209,51 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
                 weap_info = f", weapons=[{', '.join(weaps)}]"
             state_desc += f"Unit {u.id} ({u.faction}): pos={u.position}, heading={u.heading}, velocity={u.velocity}, max_thrust={max_thrust}{weap_info}\n"
             
-        action_example = "[MOVE: Unit=<id>, Posture=Aggressive, Heading=<number>, EndVelocity=<number>, Path=1001,1002]"
+        action_example = "[MOVE: TargetHex=<hex>, EndVelocity=<number>, EndHeading=<number>]"
         if "Combat" in phase:
             action_example = "[FIRE: Target=<id>, Weapons=<w1;w2;...>, Painting=True/False]"
+
+        movement_options_text = ""
+        if "Movement" in phase:
+            movement_options_text = "\n[MOVEMENT SYSTEM REACHABILITY GRAPH]\nHere are all valid hexes you can reach, their allowed Ending Velocities, and Ending Headings:\n"
+            for u in engine.wsm.get_state().units.values():
+                if u.faction == active_faction:
+                    try:
+                        calc_func = self.get_or_generate_mechanic("calculate_movement_options", "Calculate valid movement reachability graph.")
+                        options = calc_func(u, engine.wsm)
+                        movement_options_text += f"Unit {u.id} Options:\n"
+                        for hex_id, opt_list in options.items():
+                            vmap = {}
+                            for o in opt_list:
+                                v = o['vel']
+                                h = o['heading']
+                                if v not in vmap:
+                                    vmap[v] = []
+                                vmap[v].append(h)
+                                
+                            parts = []
+                            for v, hs in vmap.items():
+                                hs.sort()
+                                parts.append(f"V{v}:H{''.join(map(str, hs))}")
+                                
+                            movement_options_text += f"  - {hex_id} -> {' '.join(parts)}\n"
+                    except Exception as e:
+                        movement_options_text += f"(Error generating options: {e})\n"
 
         arbiter_prompt = (
             f"The state is:\n{state_desc}\n"
             f"Simulation Objective: {objective}\n\n"
+            f"{movement_options_text}\n"
             f"It is your {phase}. Please ask me any questions about the rules, your capabilities, or terms you do not understand before deciding.\n"
             f"*IMPORTANT RULE: Hex facing needs to be set as clockwise from top, where top is 1, bottom is 4.*\n"
             f"When you are ready to act, issue your command in a structured format for each unit you control, e.g. {action_example}"
         )
+        sys_prompt = f"You are the {active_faction.upper()} commander. First ask the Game Master (Arbiter) questions about the rules, then decide your move. Use the Simulation Objective to guide your actions."
+        sys_prompt += f"\nYour current overarching plan is: {commander.current_plan}"
+        sys_prompt += f"\nYou may update your overarching strategy for future turns by including [PLAN: <your new plan>] in your final action response."
         
         messages = [
-            {"role": "system", "content": f"You are the {active_faction.upper()} commander. First ask the Game Master (Arbiter) questions about the rules, then decide your move. Use the Simulation Objective to guide your actions."},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": arbiter_prompt}
         ]
         
@@ -218,9 +269,14 @@ You must issue the command [GENERATE_ENGINE_RULE: {mechanic_name}] at the end of
             content = response["message"]["content"]
             print(f"[{active_faction.upper()} COMMANDER]:\n{content}\n")
             messages.append(response["message"])
+            # Check if a plan was updated
+            plan_match = re.search(r'\[PLAN:\s*(.*?)\]', content, re.IGNORECASE)
+            if plan_match:
+                commander.current_plan = plan_match.group(1).strip()
+                print(f"[{active_faction.upper()} COMMANDER updated their plan]: {commander.current_plan}")
             
             # Check if an action was issued
-            if "[" in content and "]" in content and ":" in content:
+            if "[" in content and "]" in content and ":" in content and ("MOVE:" in content.upper() or "FIRE:" in content.upper()):
                 final_action = content
                 break
                 
@@ -280,6 +336,7 @@ class SideCommander:
         self.faction_name = faction_name
         self.dynamic_globals = dynamic_globals
         self.model_name = model_name
+        self.current_plan = "No plan established yet."
 
     def evaluate_and_act(self, wsm: WorldStateManager, phase: str, context: str = "") -> str:
         """
@@ -293,14 +350,18 @@ class SideCommander:
             
         if phase == "Movement Phase" or "Movement" in phase:
             sys_prompt = f"You are the Side Commander for {self.faction_name.upper()}.\nCurrent State:\n{state_desc}\nYour goal is to get as close to the enemy as you can.\n"
+            sys_prompt += f"Your current overarching plan is: {self.current_plan}\n"
             sys_prompt += "Decide your posture and movement. Postures: Neutral, Aggressive, Defensive.\n"
             sys_prompt += "You can ask the Game Master (Master Arbiter) for any rules you need before deciding.\n"
-            sys_prompt += "Issue your command like this for EACH of your units when ready:\n[MOVE: Unit=<id>, Posture=Aggressive, Heading=<number>, EndVelocity=<number>, Path=1001,1002]\nExplain your reasoning first."
+            sys_prompt += "Issue your command like this for EACH of your units when ready:\n[MOVE: Unit=<id>, Posture=Aggressive, Heading=<number>, EndVelocity=<number>, Path=1001,1002]\n"
+            sys_prompt += "You may update your plan by including [PLAN: <your new plan>]\nExplain your reasoning first."
         elif phase == "Combat Phase" or "Combat" in phase:
             sys_prompt = f"You are the Side Commander for {self.faction_name.upper()}.\nCurrent State:\n{state_desc}\nYour goal is to destroy the enemy tank and survive.\n"
+            sys_prompt += f"Your current overarching plan is: {self.current_plan}\n"
             sys_prompt += f"{context}\n" if context else ""
             sys_prompt += "Decide your fire barrage at enemy units. You may fire multiple weapons in your arc simultaneously.\n"
-            sys_prompt += "Issue command exactly like this when ready:\n[FIRE: Target=hor1, TargetFacing=Front, Weapons=Laser;150mm;TVLG, Painting=True]\nExplain your logic."
+            sys_prompt += "Issue command exactly like this when ready:\n[FIRE: Target=hor1, TargetFacing=Front, Weapons=Laser;150mm;TVLG, Painting=True]\n"
+            sys_prompt += "You may update your plan by including [PLAN: <your new plan>]\nExplain your logic."
         else:
             sys_prompt = f"You are the Side Commander for {self.faction_name.upper()}.\nCurrent phase is {phase}. Do nothing or ask the Arbiter what to do."
 
@@ -312,6 +373,11 @@ class SideCommander:
             
         content = response["message"]["content"]
         print(f"[{self.faction_name.upper()} Commander]:\n{content.strip()}\n")
+        
+        plan_match = re.search(r'\[PLAN:\s*(.*?)\]', content, re.IGNORECASE)
+        if plan_match:
+            self.current_plan = plan_match.group(1).strip()
+            print(f"[{self.faction_name.upper()} COMMANDER updated their plan]: {self.current_plan}")
         
         # Log to reasoning trace
         trace_path = "C:/Users/dapoo/.gemini/antigravity-ide/brain/68c2581d-4958-44bc-8dcc-ceb65471fe04/reasoning_trace.md"

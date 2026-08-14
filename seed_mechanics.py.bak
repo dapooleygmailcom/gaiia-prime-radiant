@@ -1,0 +1,412 @@
+import sqlite3
+
+db_path = "state/cache/rule_cache.db"
+
+def inject_mechanic(mechanic_name, python_code):
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS compiled_mechanics (
+                mechanic_name TEXT PRIMARY KEY,
+                python_code TEXT,
+                last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.execute("""
+            INSERT OR REPLACE INTO compiled_mechanics (mechanic_name, python_code, last_accessed)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+        """, (mechanic_name, python_code))
+
+# ─────────────────────────────────────────────────────────────
+# resolve_movement  (Fix #1, #2, #6, #9)
+# ─────────────────────────────────────────────────────────────
+resolve_movement_code = r"""
+import re
+
+# Fix #1: True rhombus hex-grid adjacency (6 legal directions for XXYY grid).
+# Verified against river path: 0001→0101(+1,0), 0101→0202(+1,+1), 0303→0304(0,+1).
+VALID_HEX_DIRS = frozenset([(0,-1),(1,0),(1,1),(0,1),(-1,0),(-1,-1)])
+
+# Inferred heading per step direction (clockwise from N=1)
+DIR_TO_HEADING = {(0,-1):1, (1,0):2, (1,1):3, (0,1):4, (-1,0):5, (-1,-1):6}
+
+# Terrain movement costs (hexes of "budget" consumed per hex traversed)
+TERRAIN_MOVEMENT_COST = {"Clear":1, "River":1, "Light Woods":2, "Woods":3, "Rough":2}
+
+def resolve_movement(unit, wsm, command_string):
+    # ── Parse ────────────────────────────────────────────────
+    vel_match = re.search(r'EndVelocity=(\d+)', command_string, re.IGNORECASE)
+    end_vel = int(vel_match.group(1)) if vel_match else unit.velocity
+
+    heading_match = re.search(r'Heading=(\d+)', command_string, re.IGNORECASE)
+    new_heading = int(heading_match.group(1)) if heading_match else unit.heading
+
+    path_match = re.search(r'Path=([0-9,]+)', command_string, re.IGNORECASE)
+    if not path_match:
+        if end_vel != unit.velocity:
+            raise ValueError(
+                f"Velocity change declared ({unit.velocity}->{end_vel}) but no Path was provided."
+            )
+        hexes = []
+    else:
+        raw_hexes = [h.strip().upper() for h in path_match.group(1).split(',') if h.strip()]
+        # Forgiveness: LLM sometimes includes starting hex as first element
+        if raw_hexes and raw_hexes[0] == unit.position:
+            raw_hexes = raw_hexes[1:]
+            
+        DIR_MAP = {"N":(0,-1), "NE":(1,0), "SE":(1,1), "S":(0,1), "SW":(-1,0), "NW":(-1,-1)}
+        hexes = []
+        curr_pos = unit.position
+        for h in raw_hexes:
+            if h in DIR_MAP:
+                dx, dy = DIR_MAP[h]
+                try:
+                    x, y = int(curr_pos[:2]), int(curr_pos[2:])
+                    nx, ny = x + dx, y + dy
+                    next_hex = f"{nx:02d}{ny:02d}"
+                    hexes.append(next_hex)
+                    curr_pos = next_hex
+                except ValueError:
+                    raise ValueError(f"Invalid starting pos for directional math: {curr_pos}")
+            else:
+                hexes.append(h)
+                curr_pos = h
+
+    # ── Fix #9: turn radius (inline to avoid globals dependency) ──
+    def turn_radius(velocity):
+        # Renegade Legion: 1-4=0, 5-9=1, 10-14=2, 15-19=3
+        return int(velocity / 5)
+
+    # ── Fix #6: terrain cost helper ──────────────────────────
+    def terrain_cost(hex_coord, prev_hex):
+        hex_data = wsm.get_state().map_hexes.get(hex_coord, {})
+        terrain = hex_data.get("terrain", "Clear")
+        base = TERRAIN_MOVEMENT_COST.get(terrain, 1)
+        # Elevation change: each level gained costs +1 extra
+        if prev_hex:
+            prev_data = wsm.get_state().map_hexes.get(prev_hex, {})
+            elev_gain = hex_data.get("elevation", 0) - prev_data.get("elevation", 0)
+            if elev_gain > 0:
+                base += elev_gain
+        return base
+
+    # ── Movement budget (Fix #2 ordering note: compute all costs first) ──
+    # Budget = max(start, end velocity) — you travel at whichever is higher:
+    #   accelerating: spend thrust first, then move at end_vel hexes
+    #   decelerating: move at start_vel hexes, then brake
+    movement_budget = max(unit.velocity, end_vel)
+
+    # ── Validate path ────────────────────────────────────────
+    current_pos = unit.position
+    current_step_heading = unit.heading
+    hexes_since_last_turn = 0
+    total_terrain_cost = 0
+
+    for i, h in enumerate(hexes):
+        # Coordinate parsing
+        try:
+            x1, y1 = int(current_pos[:2]), int(current_pos[2:])
+            x2, y2 = int(h[:2]), int(h[2:])
+        except ValueError:
+            raise ValueError(
+                f"Invalid hex coordinate '{h}'. All coordinates must be 4 digits XXYY."
+            )
+
+        dx, dy = x2 - x1, y2 - y1
+
+        # Fix #1: reject illegal moves (not in 6 valid hex directions)
+        if (dx, dy) not in VALID_HEX_DIRS:
+            raise ValueError(
+                f"Hex {h} is not a valid hex-grid neighbour of {current_pos}. "
+                f"Move vector ({dx},{dy}) is illegal. "
+                f"The 6 legal directions are: N(0,-1) NE(+1,0) SE(+1,+1) S(0,+1) SW(-1,0) NW(-1,-1)."
+            )
+
+        # Fix #9: infer step heading and check turn radius
+        step_heading = DIR_TO_HEADING[(dx, dy)]
+        if step_heading != current_step_heading:
+            facing_change = min((step_heading - current_step_heading) % 6,
+                                (current_step_heading - step_heading) % 6)
+            required = turn_radius(end_vel) * facing_change
+            if hexes_since_last_turn < required:
+                raise ValueError(
+                    f"Illegal facing change at hex {h} "
+                    f"(heading {current_step_heading}->{step_heading}, delta={facing_change} sides). "
+                    f"At velocity {end_vel}, turn radius requires {required} hexes between facing changes. "
+                    f"Only {hexes_since_last_turn} hexes moved since last turn."
+                )
+            current_step_heading = step_heading
+            hexes_since_last_turn = 0
+        else:
+            hexes_since_last_turn += 1
+
+        # Fix #6: accumulate terrain cost
+        total_terrain_cost += terrain_cost(h, current_pos)
+        current_pos = h
+
+    # Validate terrain-weighted movement cost against budget
+    if hexes and total_terrain_cost != movement_budget:
+        raise ValueError(
+            f"Terrain-weighted path cost ({total_terrain_cost}) does not match movement budget "
+            f"({movement_budget} = max(StartVelocity={unit.velocity}, EndVelocity={end_vel})). "
+            f"You moved {len(hexes)} hexes with total terrain cost {total_terrain_cost}. "
+            f"Adjust your Path length or EndVelocity to match."
+        )
+
+    # ── Fix #2: Compute ALL thrust costs BEFORE mutating any state ──
+    vel_thrust = abs(end_vel - unit.velocity)
+    heading_thrust = min((new_heading - unit.heading) % 6, (unit.heading - new_heading) % 6)
+    total_thrust_cost = vel_thrust + heading_thrust
+
+    if total_thrust_cost > unit.thrust_points:
+        raise ValueError(
+            f"Insufficient thrust. This move requires {total_thrust_cost} thrust "
+            f"({vel_thrust} for velocity {unit.velocity}→{end_vel}, "
+            f"{heading_thrust} for heading change {unit.heading}→{new_heading}), "
+            f"but unit only has {unit.thrust_points} thrust remaining."
+        )
+
+    # ── Apply (only after all validation passes) ─────────────
+    if hexes:
+        unit.position = hexes[-1]
+    unit.velocity = end_vel
+    unit.heading = new_heading
+    unit.thrust_points -= total_thrust_cost
+"""
+
+# ─────────────────────────────────────────────────────────────
+# get_movement_stats
+# ─────────────────────────────────────────────────────────────
+get_movement_stats_code = """
+def get_movement_stats(unit, wsm):
+    profile = getattr(unit, 'entity_profile', {})
+    attrs = profile.get('attributes', {})
+    max_thrust = attrs.get('Maximum Thrust', 0)
+    safe_speed = max_thrust
+    max_velocity = max_thrust * 2
+    return {
+        'max_velocity': max_velocity,
+        'max_thrust': max_thrust,
+        'safe_speed': safe_speed
+    }
+"""
+
+# ─────────────────────────────────────────────────────────────
+# calculate_turn_radius  (Fix TC4 seeding)
+# ─────────────────────────────────────────────────────────────
+calculate_turn_radius_code = """
+def calculate_turn_radius(velocity):
+    # Renegade Legion: velocity 1-4=0, 5-9=1, 10-14=2, 15-19=3 hexes before facing change
+    return int(velocity / 5)
+"""
+
+inject_mechanic("resolve_movement", resolve_movement_code)
+inject_mechanic("get_movement_stats", get_movement_stats_code)
+inject_mechanic("calculate_turn_radius", calculate_turn_radius_code)
+
+print("Mechanics seeded successfully!")
+print("  resolve_movement : adjacency(6-dir), turn-radius, terrain-cost, thrust-validate-before-mutate")
+print("  get_movement_stats : max_thrust, safe_speed, max_velocity")
+print("  calculate_turn_radius : velocity -> hexes before facing change")
+
+
+# ─────────────────────────────────────────────────────────────
+# calculate_hex_range  (rhombus offset-hex grid distance)
+# ─────────────────────────────────────────────────────────────
+calculate_hex_range_code = """
+def calculate_hex_range(pos_a, pos_b):
+    x1, y1 = int(pos_a[:2]), int(pos_a[2:])
+    x2, y2 = int(pos_b[:2]), int(pos_b[2:])
+    dx, dy = x2 - x1, y2 - y1
+    if (dx >= 0 and dy >= 0) or (dx <= 0 and dy <= 0):
+        return max(abs(dx), abs(dy))
+    return abs(dx) + abs(dy)
+"""
+
+# ─────────────────────────────────────────────────────────────
+# check_los  (Smoke blocks LOS per SMOKE rule)
+# ─────────────────────────────────────────────────────────────
+check_los_code = """
+def check_los(attacker_pos, target_pos, wsm):
+    x1, y1 = int(attacker_pos[:2]), int(attacker_pos[2:])
+    x2, y2 = int(target_pos[:2]), int(target_pos[2:])
+    dx, dy = x2 - x1, y2 - y1
+    n = (max(abs(dx), abs(dy)) if ((dx >= 0 and dy >= 0) or (dx <= 0 and dy <= 0))
+         else abs(dx) + abs(dy))
+    if n == 0:
+        return True, ""
+    for i in range(1, n):
+        t = i / n
+        hid = f"{round(x1 + t*(x2-x1)):02d}{round(y1 + t*(y2-y1)):02d}"
+        if wsm.get_state().map_hexes.get(hid, {}).get("terrain") == "Smoke":
+            return False, f"Smoke hex {hid} blocks LOS"
+    return True, ""
+"""
+
+# ─────────────────────────────────────────────────────────────
+# resolve_combat  (all rules sourced from RAG-Doll)
+# ─────────────────────────────────────────────────────────────
+resolve_combat_code = r"""
+import re
+import random
+
+def _base_to_hit(r):
+    if r <= 1:   return 12
+    if r <= 3:   return 11
+    if r <= 6:   return 10
+    if r <= 10:  return 9
+    if r <= 15:  return 8
+    if r <= 20:  return 7
+    return 6
+
+TERRAIN_TO_HIT_MOD = {
+    "Light Woods": -1,
+    "Heavy Woods": -2,
+    "Smoke":       -2,
+}
+
+HEADING_TO_DIR = {1:(0,-1),2:(1,0),3:(1,1),4:(0,1),5:(-1,0),6:(-1,-1)}
+
+def _hex_range(a, b):
+    x1,y1=int(a[:2]),int(a[2:]); x2,y2=int(b[:2]),int(b[2:])
+    dx,dy=x2-x1,y2-y1
+    return (max(abs(dx),abs(dy)) if ((dx>=0 and dy>=0) or (dx<=0 and dy<=0)) else abs(dx)+abs(dy))
+
+def _check_los(ap, tp, wsm):
+    x1,y1=int(ap[:2]),int(ap[2:]); x2,y2=int(tp[:2]),int(tp[2:])
+    dx,dy=x2-x1,y2-y1
+    n=(max(abs(dx),abs(dy)) if ((dx>=0 and dy>=0) or (dx<=0 and dy<=0)) else abs(dx)+abs(dy))
+    for i in range(1,n):
+        t=i/n
+        hid=f"{round(x1+t*(x2-x1)):02d}{round(y1+t*(y2-y1)):02d}"
+        if wsm.get_state().map_hexes.get(hid,{}).get("terrain")=="Smoke":
+            return False, f"Smoke hex {hid} blocks LOS"
+    return True,""
+
+def _determine_facing(ap, tp, target_heading):
+    x1,y1=int(tp[:2]),int(tp[2:]); x2,y2=int(ap[:2]),int(ap[2:])
+    dx,dy=x2-x1,y2-y1
+    if dx==0 and dy==0: return "Front"
+    best_h,best_score=1,-9999
+    for h,(ddx,ddy) in HEADING_TO_DIR.items():
+        s=dx*ddx+dy*ddy
+        if s>best_score: best_score,best_h=s,h
+    diff=(best_h-target_heading)%6
+    return {0:"Front",1:"Right",2:"Right",3:"Stern",4:"Left",5:"Left"}[diff]
+
+def _shields_apply(wname):
+    return not any(k in wname.lower() for k in ["gauss","50mm","cannon","mortar"])
+
+def _get_sf(target, facing):
+    grids=getattr(target,'entity_profile',{}).get('grids',{})
+    gmap={"Front":"Front Armor","Stern":"Stern Armor","Left":"Left Armor","Right":"Right Armor","Turret":"Turret Armor"}
+    return grids.get(gmap.get(facing,"Front Armor"),{}).get("SF",0)
+
+def _apply_damage(target, facing, damage):
+    gmap={"Front":"Front Armor","Stern":"Stern Armor","Left":"Left Armor","Right":"Right Armor","Turret":"Turret Armor"}
+    key=gmap.get(facing,"Front Armor")
+    cols=target.damage_state.armor_grids.get(key)
+    if cols:
+        idx=random.randint(0,len(cols)-1)
+        cols[idx]=max(0,cols[idx]-damage)
+        return {"grid":key,"column":idx,"damage":damage,"remaining":cols[idx]}
+    return {}
+
+def resolve_combat(attacker, target, wsm, command_string, seed=None):
+    '''
+    Resolve [FIRE: Target=<id>, Weapons=<w1;w2;...>, Painting=True/False].
+
+    Rules (RAG-sourced):
+    - Range->to-hit: 1=12, 2-3=11, 4-6=10, 7-10=9, 11-15=8, 16-20=7, off=6
+    - Roll 1d10; hit if <= to-hit (1=auto-hit, 10=auto-miss)
+    - Terrain mod (target hex): LightWoods -1, HeavyWoods/Smoke -2
+    - Shield Factor reduces to-hit for lasers/missiles; Gauss NOT affected
+    - Painting laser: separate roll; if hit -> all attacks ignore SF this turn
+    - Hull down: -2 to-hit; all hits resolve against Turret armor
+    - Smoke in LOS -> ValueError (cannot fire)
+    - Missiles: same to-hit rules as direct fire
+    '''
+    if seed is not None:
+        random.seed(seed)
+
+    wm=re.search(r'Weapons=([^,\]]+(?:;[^,\]]+)*)',command_string,re.IGNORECASE)
+    weapon_names=[w.strip() for w in wm.group(1).split(';')] if wm else []
+    painting=bool(re.search(r'Painting\s*=\s*True',command_string,re.IGNORECASE))
+    hull_down=getattr(target,'hull_down',False)
+
+    range_hexes=_hex_range(attacker.position,target.position)
+    los_clear,los_reason=_check_los(attacker.position,target.position,wsm)
+    if not los_clear:
+        raise ValueError(f"Cannot fire: {los_reason}")
+
+    facing="Turret" if hull_down else _determine_facing(attacker.position,target.position,target.heading)
+    target_terrain=wsm.get_state().map_hexes.get(target.position,{}).get("terrain","Clear")
+    terrain_mod=TERRAIN_TO_HIT_MOD.get(target_terrain,0)
+    hull_down_mod=-2 if hull_down else 0
+    sf=_get_sf(target,facing)
+
+    painting_hit,painting_roll=False,None
+    if painting:
+        if range_hexes>20:
+            raise ValueError("Painting laser out of range (max 20 hexes)")
+        p_mod=max(1,min(12,_base_to_hit(range_hexes)+terrain_mod+hull_down_mod))
+        painting_roll=random.randint(1,10)
+        painting_hit=(painting_roll==1) or (painting_roll!=10 and painting_roll<=p_mod)
+
+    effective_sf_mod=0 if painting_hit else -sf
+    attacker_weapons=attacker.entity_profile.get('collections',{}).get('Weapons',[])
+    eligible,blocked=[],{}
+
+    for wname in weapon_names:
+        matched=next((w for w in attacker_weapons
+                      if wname.lower() in w.get('Name','').lower()
+                      or w.get('Name','').lower() in wname.lower()),None)
+        if not matched:
+            blocked[wname]="Weapon not found on this vehicle"
+            continue
+        w_rng=matched.get('Range','N/A')
+        if w_rng!='N/A' and range_hexes>int(w_rng):
+            blocked[matched['Name']]=f"Out of range ({range_hexes} > max {w_rng})"
+            continue
+        if 'TVLG' in matched['Name']:
+            if not hasattr(attacker,'tvlg_ammo'):
+                attacker.tvlg_ammo=next((m['Count'] for m in attacker.entity_profile.get('collections',{}).get('Missiles',[]) if m['Type']=='TVLG'),0)
+            if attacker.tvlg_ammo<=0:
+                raise ValueError(f"Cannot fire {matched['Name']}: no TVLG ammo remaining")
+        if 'SMLM' in matched['Name']:
+            if not hasattr(attacker,'smlm_ammo'):
+                attacker.smlm_ammo=next((m['Count'] for m in attacker.entity_profile.get('collections',{}).get('Missiles',[]) if m['Type']=='SMLM'),0)
+            if attacker.smlm_ammo<=0:
+                raise ValueError(f"Cannot fire {matched['Name']}: no SMLM ammo remaining")
+        eligible.append(matched)
+
+    shots=[]
+    for w in eligible:
+        sh_mod=effective_sf_mod if _shields_apply(w['Name']) else 0
+        modified=max(1,min(12,_base_to_hit(range_hexes)+terrain_mod+hull_down_mod+sh_mod))
+        roll=random.randint(1,10)
+        hit=(roll==1) or (roll!=10 and roll<=modified)
+        dmg_record={}
+        if hit:
+            try: dmg=int(w.get('Damage','6'))
+            except (ValueError,TypeError): dmg=6
+            dmg_record=_apply_damage(target,facing,dmg)
+            if 'TVLG' in w['Name']: attacker.tvlg_ammo-=1
+            if 'SMLM' in w['Name']: attacker.smlm_ammo-=1
+        shots.append({"weapon":w['Name'],"base_to_hit":_base_to_hit(range_hexes),
+                      "modifiers":{"terrain":terrain_mod,"hull_down":hull_down_mod,"shield":sh_mod},
+                      "modified_to_hit":modified,"roll":roll,"hit":hit,"damage":dmg_record})
+
+    return {"range":range_hexes,"facing":facing,"hull_down":hull_down,
+            "painting_roll":painting_roll,"painting_hit":painting_hit,
+            "sf_negated":painting_hit and sf>0,
+            "eligible_weapons":[w['Name'] for w in eligible],
+            "blocked_weapons":blocked,"shots":shots}
+"""
+
+inject_mechanic("calculate_hex_range", calculate_hex_range_code)
+inject_mechanic("check_los", check_los_code)
+inject_mechanic("resolve_combat", resolve_combat_code)
+
+print("  calculate_hex_range   : rhombus hex distance")
+print("  check_los             : LOS check (smoke blocks)")
+print("  resolve_combat        : to-hit table, shields, terrain, painting, facing, damage")
