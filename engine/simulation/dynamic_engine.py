@@ -493,7 +493,7 @@ class DynamicEngine:
         """
         Ingests a Vassal map or module file directly into the engine's WorldStateManager.
         """
-        importer = VassalMapImporter(simulation_id=self.simulation_name)
+        importer = VassalMapImporter(simulation_id=self.simulation_id)
         importer.load_into_wsm(self.wsm, vmod_or_xml_path, board_id=board_id)
 
     def check_los(self, origin: Any, target: Any) -> Tuple[bool, List[str], str]:

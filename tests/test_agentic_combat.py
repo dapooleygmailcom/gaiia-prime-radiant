@@ -3,9 +3,18 @@ import re
 from engine.simulation.dynamic_engine import DynamicEngine
 
 
+import os
+
 def setup_combat_test(name, lib_pos="0101", hor_pos="0106"):
     engine = DynamicEngine(name)
     engine.add_commander("commonwealth") 
+    
+    # Ingest Centurion Map 1
+    vmod_path = os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "../data/vassal_modules/Renegade_Legion_Centurion_1.2.vmod"
+    ))
+    if os.path.exists(vmod_path):
+        engine.load_vassal_map(vmod_path, board_id="map_1")
     
     lib = engine.wsm.create_unit_from_entity("lib1", "commonwealth", "rl_liberator_medium_grav_tank", engine.rules)
     lib.position = lib_pos

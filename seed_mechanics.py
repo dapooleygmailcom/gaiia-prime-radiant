@@ -376,7 +376,7 @@ def check_los(attacker_pos, target_pos, wsm):
 """
 
 # ─────────────────────────────────────────────────────────────
-# resolve_combat  (all rules sourced from RAG-Doll)
+# resolve_combat  (all rules sourced from RAG-Doll & Centurion SSDs)
 # ─────────────────────────────────────────────────────────────
 resolve_combat_code = r"""
 import re
@@ -398,6 +398,29 @@ TERRAIN_TO_HIT_MOD = {
 }
 
 HEADING_TO_DIR = {1:(0,-1),2:(1,0),3:(1,1),4:(0,1),5:(-1,0),6:(-1,-1)}
+
+DAMAGE_TEMPLATES = {
+    "150mm":     {"pattern": [2, 4, 2], "center": 1, "name": "150mm Gauss Template [2, 4, 2]"},
+    "50mm":      {"pattern": [1, 2, 1], "center": 1, "name": "50mm Gauss Template [1, 2, 1]"},
+    "5/6 Laser": {"pattern": [5],       "center": 0, "name": "5/6 Laser Column [5]"},
+    "3/6 Laser": {"pattern": [4],       "center": 0, "name": "3/6 Laser Column [4]"},
+    "Laser":     {"pattern": [5],       "center": 0, "name": "Laser Column [5]"},
+    "TVLG":      {"pattern": [2, 2, 5, 2, 2], "center": 2, "name": "TVLG Inverted-T Template [2, 2, 5, 2, 2]"},
+    "SMLM":      {"pattern": [1, 2, 2, 1], "center": 1, "name": "SMLM Missile Template [1, 2, 2, 1]"},
+    "Vulcan":    {"pattern": [1, 1, 1, 1, 1], "center": 2, "name": "Vulcan PD Spread [1, 1, 1, 1, 1]"}
+}
+
+def _get_weapon_template(wname):
+    w_low = wname.lower()
+    if "150mm" in w_low: return DAMAGE_TEMPLATES["150mm"]
+    if "50mm" in w_low:  return DAMAGE_TEMPLATES["50mm"]
+    if "5/6" in w_low or ("laser" in w_low and "5" in w_low): return DAMAGE_TEMPLATES["5/6 Laser"]
+    if "3/6" in w_low or ("laser" in w_low and "3" in w_low): return DAMAGE_TEMPLATES["3/6 Laser"]
+    if "tvlg" in w_low:  return DAMAGE_TEMPLATES["TVLG"]
+    if "smlm" in w_low:  return DAMAGE_TEMPLATES["SMLM"]
+    if "vulcan" in w_low: return DAMAGE_TEMPLATES["Vulcan"]
+    if "laser" in w_low: return DAMAGE_TEMPLATES["Laser"]
+    return {"pattern": [3], "center": 0, "name": f"{wname} Standard"}
 
 def _hex_range(a, b):
     x1,y1=int(a[:2]),int(a[2:]); x2,y2=int(b[:2]),int(b[2:])
@@ -427,36 +450,110 @@ def _determine_facing(ap, tp, target_heading):
     return {0:"Front",1:"Right",2:"Right",3:"Stern",4:"Left",5:"Left"}[diff]
 
 def _shields_apply(wname):
-    return not any(k in wname.lower() for k in ["gauss","50mm","cannon","mortar"])
+    # Gauss weapons ignore shields; Lasers, Missiles are affected
+    return not any(k in wname.lower() for k in ["gauss", "150mm", "50mm", "cannon", "mortar"])
 
 def _get_sf(target, facing):
     grids=getattr(target,'entity_profile',{}).get('grids',{})
     gmap={"Front":"Front Armor","Stern":"Stern Armor","Left":"Left Armor","Right":"Right Armor","Turret":"Turret Armor"}
     return grids.get(gmap.get(facing,"Front Armor"),{}).get("SF",0)
 
-def _apply_damage(target, facing, damage):
-    gmap={"Front":"Front Armor","Stern":"Stern Armor","Left":"Left Armor","Right":"Right Armor","Turret":"Turret Armor"}
-    key=gmap.get(facing,"Front Armor")
-    cols=target.damage_state.armor_grids.get(key)
-    if cols:
-        idx=random.randint(0,len(cols)-1)
-        cols[idx]=max(0,cols[idx]-damage)
-        return {"grid":key,"column":idx,"damage":damage,"remaining":cols[idx]}
-    return {}
+def _apply_damage(target, facing, weapon_name, center_col=None):
+    gmap = {
+        "Front":  ("Front Armor",  "Front Internals"),
+        "Stern":  ("Stern Armor",  "Stern Internals"),
+        "Left":   ("Left Armor",   "Left Internals"),
+        "Right":  ("Right Armor",  "Right Internals"),
+        "Turret": ("Turret Armor", "Turret Internals")
+    }
+    armor_key, int_key = gmap.get(facing, ("Front Armor", "Front Internals"))
+    armor_cols = getattr(target, 'damage_state', None) and target.damage_state.armor_grids.get(armor_key)
+    
+    if armor_cols is None and hasattr(target, 'damage_state'):
+        # Fallback search
+        for k in target.damage_state.armor_grids:
+            if facing.lower() in k.lower():
+                armor_key = k
+                armor_cols = target.damage_state.armor_grids[k]
+                break
+                
+    if armor_cols is None:
+        armor_cols = [0] * 10
+        
+    num_cols = len(armor_cols)
+    if center_col is None:
+        center_col = random.randint(0, num_cols - 1)
+        
+    tmpl = _get_weapon_template(weapon_name)
+    pattern = tmpl["pattern"]
+    center_idx = tmpl["center"]
+    
+    col_records = []
+    internal_hits = []
+    total_armor_damage = 0
+    
+    int_cols_profile = getattr(target, 'entity_profile', {}).get('grids', {}).get(int_key, {}).get('Columns', [])
+    int_matrix = getattr(target, 'damage_state', None) and target.damage_state.internal_grids.get(int_key)
+    
+    for offset, penetration in enumerate(pattern):
+        c_idx = center_col + (offset - center_idx)
+        if 0 <= c_idx < num_cols:
+            orig_depth = armor_cols[c_idx]
+            dmg_to_armor = min(orig_depth, penetration)
+            armor_cols[c_idx] = max(0, orig_depth - penetration)
+            total_armor_damage += dmg_to_armor
+            excess = penetration - orig_depth
+            
+            penetrated_comps = []
+            if excess > 0:
+                if int_matrix and c_idx < len(int_matrix):
+                    col_bays = int_matrix[c_idx]
+                    comp_names = int_cols_profile[c_idx] if c_idx < len(int_cols_profile) else []
+                    
+                    for r_idx in range(min(excess, len(col_bays))):
+                        col_bays[r_idx] = True
+                        c_name = comp_names[r_idx] if r_idx < len(comp_names) else f"Bay R{r_idx+1}"
+                        if c_name and c_name != "Empty":
+                            penetrated_comps.append(c_name)
+                            internal_hits.append(f"Col {c_idx+1} ({c_name})")
+                            
+            col_records.append({
+                "column": c_idx + 1,
+                "penetration": penetration,
+                "armor_absorbed": dmg_to_armor,
+                "remaining_armor": armor_cols[c_idx],
+                "excess_penetration": max(0, excess),
+                "internal_hits": penetrated_comps
+            })
+            
+    return {
+        "grid": armor_key,
+        "column": center_col,
+        "impact_column": center_col + 1,
+        "template": tmpl["name"],
+        "pattern": pattern,
+        "damage": total_armor_damage,
+        "armor_damage": total_armor_damage,
+        "remaining": armor_cols[center_col] if 0 <= center_col < len(armor_cols) else 0,
+        "column_records": col_records,
+        "internal_hits": internal_hits
+    }
 
 def resolve_combat(attacker, target, wsm, command_string, seed=None):
     '''
     Resolve [FIRE: Target=<id>, Weapons=<w1;w2;...>, Painting=True/False].
 
-    Rules (RAG-sourced):
+    Rules (RAG-sourced & Authentic Centurion Mechanics):
     - Range->to-hit: 1=12, 2-3=11, 4-6=10, 7-10=9, 11-15=8, 16-20=7, off=6
     - Roll 1d10; hit if <= to-hit (1=auto-hit, 10=auto-miss)
     - Terrain mod (target hex): LightWoods -1, HeavyWoods/Smoke -2
-    - Shield Factor reduces to-hit for lasers/missiles; Gauss NOT affected
-    - Painting laser: separate roll; if hit -> all attacks ignore SF this turn
+    - Shield Factor (SF): Reduces to-hit for Painting Laser, Energy Lasers, Missiles; Gauss NOT affected
+    - Painting laser: Roll vs (base - terrain - hull_down - target_facing_sf); if hit -> negates target SF for all friendly attacks this turn
     - Hull down: -2 to-hit; all hits resolve against Turret armor
     - Smoke in LOS -> ValueError (cannot fire)
-    - Missiles: same to-hit rules as direct fire
+    - Gauss & Lasers & Vulcans: Unlimited ammunition
+    - Missiles (TVLG, SMLM): Limited ammunition as tracked on SSD (e.g. TVLG=4, SMLM=2)
+    - Damage: Full 2D template resolution across columns + internal penetration
     '''
     if seed is not None:
         random.seed(seed)
@@ -477,14 +574,17 @@ def resolve_combat(attacker, target, wsm, command_string, seed=None):
     hull_down_mod=-2 if hull_down else 0
     sf=_get_sf(target,facing)
 
+    # Painting Laser Resolution (Affected by Target Facing Shield Factor)
     painting_hit,painting_roll=False,None
     if painting:
         if range_hexes>20:
             raise ValueError("Painting laser out of range (max 20 hexes)")
-        p_mod=max(1,min(12,_base_to_hit(range_hexes)+terrain_mod+hull_down_mod))
+        # Target facing SF directly reduces the painting laser to-hit target number!
+        p_mod=max(1,min(12,_base_to_hit(range_hexes)+terrain_mod+hull_down_mod - sf))
         painting_roll=random.randint(1,10)
         painting_hit=(painting_roll==1) or (painting_roll!=10 and painting_roll<=p_mod)
 
+    # If painting laser succeeded, target shield factor is negated (0); otherwise full SF penalty applies
     effective_sf_mod=0 if painting_hit else -sf
     attacker_weapons=attacker.entity_profile.get('collections',{}).get('Weapons',[])
     eligible,blocked=[],{}
@@ -498,7 +598,7 @@ def resolve_combat(attacker, target, wsm, command_string, seed=None):
             continue
             
         dmg = matched.get('Damage', 'N/A')
-        if str(dmg).upper() in ['N/A', 'S', 'NONE', '']:
+        if str(dmg).upper() in ['N/A', 'S', 'NONE', ''] and not any(k in matched.get('Name','').lower() for k in ['vulcan','pd']):
             blocked[wname]=f"Weapon {matched.get('Name')} has no offensive damage profile ({dmg})"
             continue
             
@@ -506,16 +606,19 @@ def resolve_combat(attacker, target, wsm, command_string, seed=None):
         if w_rng!='N/A' and range_hexes>int(w_rng):
             blocked[matched['Name']]=f"Out of range ({range_hexes} > max {w_rng})"
             continue
-        if 'TVLG' in matched['Name']:
+            
+        # Missile Ammunition Validation (Gauss and Lasers are unlimited)
+        if 'TVLG' in matched['Name'].upper():
             if not hasattr(attacker,'tvlg_ammo'):
-                attacker.tvlg_ammo=next((m['Count'] for m in attacker.entity_profile.get('collections',{}).get('Missiles',[]) if m['Type']=='TVLG'),0)
+                attacker.tvlg_ammo=next((m['Count'] for m in attacker.entity_profile.get('collections',{}).get('Missiles',[]) if m['Type']=='TVLG'), 4)
             if attacker.tvlg_ammo<=0:
                 raise ValueError(f"Cannot fire {matched['Name']}: no TVLG ammo remaining")
-        if 'SMLM' in matched['Name']:
+        elif 'SMLM' in matched['Name'].upper():
             if not hasattr(attacker,'smlm_ammo'):
-                attacker.smlm_ammo=next((m['Count'] for m in attacker.entity_profile.get('collections',{}).get('Missiles',[]) if m['Type']=='SMLM'),0)
+                attacker.smlm_ammo=next((m['Count'] for m in attacker.entity_profile.get('collections',{}).get('Missiles',[]) if m['Type']=='SMLM'), 2)
             if attacker.smlm_ammo<=0:
                 raise ValueError(f"Cannot fire {matched['Name']}: no SMLM ammo remaining")
+                
         eligible.append(matched)
 
     shots=[]
@@ -526,20 +629,32 @@ def resolve_combat(attacker, target, wsm, command_string, seed=None):
         hit=(roll==1) or (roll!=10 and roll<=modified)
         dmg_record={}
         if hit:
-            try: dmg=int(w.get('Damage','6'))
-            except (ValueError,TypeError): dmg=6
-            dmg_record=_apply_damage(target,facing,dmg)
-            if 'TVLG' in w['Name']: attacker.tvlg_ammo-=1
-            if 'SMLM' in w['Name']: attacker.smlm_ammo-=1
-        shots.append({"weapon":w['Name'],"base_to_hit":_base_to_hit(range_hexes),
-                      "modifiers":{"terrain":terrain_mod,"hull_down":hull_down_mod,"shield":sh_mod},
-                      "modified_to_hit":modified,"roll":roll,"hit":hit,"damage":dmg_record})
+            dmg_record=_apply_damage(target,facing,w['Name'])
+            if 'TVLG' in w['Name'].upper(): attacker.tvlg_ammo-=1
+            if 'SMLM' in w['Name'].upper(): attacker.smlm_ammo-=1
+            
+        shots.append({
+            "weapon":w['Name'],
+            "base_to_hit":_base_to_hit(range_hexes),
+            "modifiers":{"terrain":terrain_mod,"hull_down":hull_down_mod,"shield":sh_mod},
+            "modified_to_hit":modified,
+            "roll":roll,
+            "hit":hit,
+            "damage":dmg_record
+        })
 
-    return {"range":range_hexes,"facing":facing,"hull_down":hull_down,
-            "painting_roll":painting_roll,"painting_hit":painting_hit,
-            "sf_negated":painting_hit and sf>0,
-            "eligible_weapons":[w['Name'] for w in eligible],
-            "blocked_weapons":blocked,"shots":shots}
+    return {
+        "range":range_hexes,
+        "facing":facing,
+        "hull_down":hull_down,
+        "painting_roll":painting_roll,
+        "painting_hit":painting_hit,
+        "sf_negated":painting_hit and sf>0,
+        "target_sf":sf,
+        "eligible_weapons":[w['Name'] for w in eligible],
+        "blocked_weapons":blocked,
+        "shots":shots
+    }
 """
 
 inject_mechanic("calculate_hex_range", calculate_hex_range_code)
@@ -548,4 +663,5 @@ inject_mechanic("resolve_combat", resolve_combat_code)
 
 print("  calculate_hex_range   : rhombus hex distance")
 print("  check_los             : LOS check (smoke blocks)")
-print("  resolve_combat        : to-hit table, shields, terrain, painting, facing, damage")
+print("  resolve_combat        : template damage, internal damage, SF painting modifier, missile ammo")
+

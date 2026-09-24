@@ -212,7 +212,13 @@ class VassalMapImporter:
         wsm.current_state.spatial_state = spatial_state
 
         # Sync all global hexes into Centurion World State and NetworkX graph
-        for g_id, cell in spatial_state.global_hexes.items():
+        cells_to_sync = []
+        if board_id and board_id in spatial_state.boards:
+            cells_to_sync = list(spatial_state.boards[board_id].hexes.values())
+        else:
+            cells_to_sync = list(spatial_state.global_hexes.values())
+
+        for cell in cells_to_sync:
             terrain_val = cell.base_terrain.value if hasattr(cell.base_terrain, "value") else str(cell.base_terrain)
             wsm.set_hex(
                 col=cell.col,

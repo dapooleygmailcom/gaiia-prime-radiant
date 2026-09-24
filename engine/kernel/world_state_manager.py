@@ -31,6 +31,9 @@ class CenturionUnit(BaseModel):
     heading: int = 0
     thrust_points: int = 10
     pilot_skill: int = 5
+    counter_name: Optional[str] = Field(default=None, description="Vassal counter name e.g. 'Liberator' or 'Horatius'")
+    counter_image: Optional[str] = Field(default=None, description="Vassal counter sprite path e.g. 'images/Gravtank-Liberator.png'")
+    counter_prototype: Optional[str] = Field(default=None, description="Vassal prototype e.g. 'RL/CW Grav Tank' or 'TOG Grav Tank'")
     soft_state: SoftState = Field(default_factory=SoftState)
     is_destroyed: bool = False
     spotted_by: List[str] = Field(default_factory=list, description="Factions that have spotted this unit")
@@ -288,9 +291,40 @@ class WorldStateManager:
                 depth = len(cols[0]) if width > 0 else 0
                 damage_state.internal_grids[grid_name] = [[False] * depth for _ in range(width)]
                 
-        tvlg_ammo = next((m['Count'] for m in profile.get('collections',{}).get('Missiles',[]) if m['Type']=='TVLG'), 0)
-        smlm_ammo = next((m['Count'] for m in profile.get('collections',{}).get('Missiles',[]) if m['Type']=='SMLM'), 0)
+        tvlg_ammo = next((m['Count'] for m in profile.get('collections',{}).get('Missiles',[]) if m['Type']=='TVLG'), None)
+        if tvlg_ammo is None:
+            for w in profile.get('collections',{}).get('Weapons',[]):
+                m = re.search(r'TVLG\s*\((\d+)\)', w.get('Name',''), re.IGNORECASE)
+                if m: tvlg_ammo = int(m.group(1))
+        if tvlg_ammo is None: tvlg_ammo = 0
+
+        smlm_ammo = next((m['Count'] for m in profile.get('collections',{}).get('Missiles',[]) if m['Type']=='SMLM'), None)
+        if smlm_ammo is None:
+            for w in profile.get('collections',{}).get('Weapons',[]):
+                m = re.search(r'SMLM\s*\((\d+)\)', w.get('Name',''), re.IGNORECASE)
+                if m: smlm_ammo = int(m.group(1))
+        if smlm_ammo is None: smlm_ammo = 0
         
+        # Generic Vassal Counter / Piece Resolution
+        counter_data = profile.get("counter", {})
+        clean_name = profile.get("name", entity_name)
+        for prefix in ["RL ", "TOG ", "CW ", "rl_", "tog_", "cw_"]:
+            if clean_name.lower().startswith(prefix.lower()):
+                clean_name = clean_name[len(prefix):]
+        clean_name = clean_name.split("_")[0].capitalize() if "_" in clean_name else clean_name.capitalize()
+
+        proto_default = "TOG Grav Tank" if "tog" in faction.lower() else "RL/CW Grav Tank"
+        
+        counter_name = counter_data.get("name") or profile.get("name", clean_name)
+        counter_image = counter_data.get("image") or f"images/Gravtank-{clean_name}.png"
+        counter_proto = counter_data.get("prototype") or proto_default
+
+        dynamic_props = {
+            "tvlg_ammo": tvlg_ammo,
+            "smlm_ammo": smlm_ammo,
+            "thrust_points": thrust
+        }
+
         unit = CenturionUnit(
             id=id,
             name=profile.get("name", entity_name),
@@ -298,6 +332,10 @@ class WorldStateManager:
             tvlg_ammo=tvlg_ammo,
             smlm_ammo=smlm_ammo,
             thrust_points=thrust,
+            counter_name=counter_name,
+            counter_image=counter_image,
+            counter_prototype=counter_proto,
+            dynamic_properties=dynamic_props,
             entity_profile=profile,
             damage_state=damage_state
         )

@@ -90,7 +90,7 @@ class RulesInterface:
             # We found an exact matching key in our rules index
             entries = self.rule_index[matched_key]
             # Retrieve text from the database directly via entries
-            collection = _get_active_collection()
+            collection = _get_active_collection() if callable(_get_active_collection) else None
             if collection and entries:
                 chunk_id = entries[0].get("chunk_id")
                 try:
@@ -116,7 +116,7 @@ class RulesInterface:
             }
 
         # Perform semantic lookup (Path 2 direct fetch)
-        collection = _get_active_collection()
+        collection = _get_active_collection() if callable(_get_active_collection) else None
         if collection:
             # Generate embedding using ollama or semantic query
             try:

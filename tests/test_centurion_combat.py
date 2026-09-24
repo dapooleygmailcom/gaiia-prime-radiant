@@ -161,7 +161,7 @@ def test_tc3_missile_fire_and_defensive():
     smlm_shot = r_def['shots'][0]
     assert smlm_shot['base_to_hit'] == 10  # same range band
     # Verify ammo was consumed
-    assert hasattr(hor, 'smlm_ammo') and hor.smlm_ammo == 0  # started with 1 round, fired 1
+    assert hasattr(hor, 'smlm_ammo') and hor.smlm_ammo == 1  # started with 2 rounds, fired 1 -> 1 remaining
 
 
 # ════════════════════════════════════════════════════════════════
