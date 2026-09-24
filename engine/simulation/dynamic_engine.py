@@ -2,11 +2,14 @@ import re
 import traceback
 import random
 import ollama
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple, Union
 
 from engine.rules.rules_interface import RulesInterface
 from engine.kernel.world_state_manager import WorldStateManager
 from engine.rules.rule_cache import RuleCache
+from engine.kernel.spatial_models import ManagedSpatialWorldState, HexCell, HexCoordinateConverter
+from engine.kernel.spatial_los import SpatialLOSArbiter, SpatialPathfinder
+from engine.ingestion.vassal_importer import VassalMapImporter
 
 class MasterArbiter:
     """
@@ -485,5 +488,35 @@ class DynamicEngine:
                 raise RuntimeError("Failed to generate or retrieve resolve_movement mechanic")
                 
         return "Command not recognized or unsupported phase."
+
+    def load_vassal_map(self, vmod_or_xml_path: str, board_id: Optional[str] = None):
+        """
+        Ingests a Vassal map or module file directly into the engine's WorldStateManager.
+        """
+        importer = VassalMapImporter(simulation_id=self.simulation_name)
+        importer.load_into_wsm(self.wsm, vmod_or_xml_path, board_id=board_id)
+
+    def check_los(self, origin: Any, target: Any) -> Tuple[bool, List[str], str]:
+        """
+        Arbitrates Line of Sight between two units or hex coordinates.
+        """
+        # Resolve unit positions if unit IDs passed
+        if isinstance(origin, str) and origin in self.wsm.get_state().units:
+            origin = self.wsm.get_state().units[origin].position
+        if isinstance(target, str) and target in self.wsm.get_state().units:
+            target = self.wsm.get_state().units[target].position
+
+        return SpatialLOSArbiter.check_los(origin, target, self.wsm.spatial_state)
+
+    def find_path(self, start: Any, goal: Any, unit_mode: str = "ground") -> Tuple[Optional[List[HexCell]], float]:
+        """
+        Finds optimal movement path across the spatial world state.
+        """
+        if isinstance(start, str) and start in self.wsm.get_state().units:
+            start = self.wsm.get_state().units[start].position
+        if isinstance(goal, str) and goal in self.wsm.get_state().units:
+            goal = self.wsm.get_state().units[goal].position
+
+        return SpatialPathfinder.find_path(start, goal, self.wsm.spatial_state, unit_mode=unit_mode)
 
 
